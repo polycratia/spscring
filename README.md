@@ -51,6 +51,13 @@ on x86.
 The consumer is the mirror image: its release on `read_` is what stops the
 producer reusing a slot before the move out of it has finished.
 
+`size()` loads `read_` first, `write_` second, and clamps the difference to the
+capacity. A monitoring thread's two loads can straddle a pop followed by a push;
+in the other order the unsigned subtraction hands it a number near 2^64, and
+`empty()` and `full()` inherit it. With the order and the clamp any third thread
+sees a value in `[0, capacity()]`, and the producer and the consumer still get an
+exact answer.
+
 Indices count forever and are masked at use. Because the capacity is a power of
 two, the eventual wrap of the counter itself stays aligned to the capacity —
 which is the difference between a queue that is correct after 2^64 operations
@@ -73,13 +80,13 @@ variant. It is a correct baseline you can read in one sitting.
 
 | | |
 |---|---|
-| Implemented | bounded ring for one producer and one consumer, move-through, power-of-two capacity, cache-line separated indices, instantaneous `size` for metrics |
+| Implemented | bounded ring for one producer and one consumer, move-through, power-of-two capacity, cache-line separated indices, instantaneous `size` for metrics, safe to sample from a third thread |
 | Not yet | batch push and pop, a blocking wrapper with futex-style waiting, a heap-allocated runtime-capacity variant |
 
 ## Development
 
 ```bash
-make test   # 2036 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make test   # 2038 checks under AddressSanitizer and UndefinedBehaviorSanitizer
 make race   # the same suite under ThreadSanitizer
 make demo   # one million messages through a 4096-slot queue
 ```
@@ -90,4 +97,4 @@ not been through it has not been checked.
 
 ## License
 
-MIT
+MIT © polycratia — <https://polycratia.com>

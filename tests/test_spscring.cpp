@@ -1,6 +1,7 @@
 #include "spscring/spscring.hpp"
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <thread>
 #include <vector>
@@ -148,6 +149,58 @@ void a_tiny_queue_still_carries_everything() {
     CHECK(ordered);
 }
 
+// A third thread only ever reads the two indices, so it cannot corrupt the
+// queue - but it can observe a pop and a push between its two loads, and an
+// unsigned subtraction in the wrong order hands it a number near 2^64. The
+// smallest queue and the longest run make that window land often; a capacity of
+// 4 over 200000 elements caught it roughly once in three runs, which is not a
+// test.
+void a_watching_thread_never_sees_more_than_capacity() {
+    constexpr int total = 1'000'000;
+    spscring::ring<std::uint32_t, 2> q;
+    std::atomic<bool> running{true};
+    std::atomic<bool> ordered{true};
+    std::atomic<std::size_t> largest_sample{0};
+
+    std::thread producer([&] {
+        for (int i = 0; i < total; ++i) {
+            while (!q.try_push(static_cast<std::uint32_t>(i))) std::this_thread::yield();
+        }
+    });
+
+    std::thread consumer([&] {
+        int received = 0;
+        while (received < total) {
+            const auto value = q.try_pop();
+            if (!value) {
+                std::this_thread::yield();
+                continue;
+            }
+            if (*value != static_cast<std::uint32_t>(received)) {
+                ordered.store(false, std::memory_order_relaxed);
+            }
+            ++received;
+        }
+    });
+
+    std::thread watcher([&] {
+        std::size_t largest = 0;
+        while (running.load(std::memory_order_acquire)) {
+            const std::size_t sample = q.size();
+            if (sample > largest) largest = sample;
+        }
+        largest_sample.store(largest, std::memory_order_release);
+    });
+
+    producer.join();
+    consumer.join();
+    running.store(false, std::memory_order_release);
+    watcher.join();
+
+    CHECK(largest_sample.load(std::memory_order_acquire) <= q.capacity());
+    CHECK(ordered.load(std::memory_order_relaxed));
+}
+
 void the_indices_do_not_share_a_cache_line() {
     spscring::ring<int, 4> q;
     // Not a behavioural test — a layout one. If these ever land within 64 bytes
@@ -166,6 +219,7 @@ int main() {
     it_moves_rather_than_copies();
     two_threads_lose_nothing_and_reorder_nothing();
     a_tiny_queue_still_carries_everything();
+    a_watching_thread_never_sees_more_than_capacity();
     the_indices_do_not_share_a_cache_line();
     return harness::report("spscring");
 }

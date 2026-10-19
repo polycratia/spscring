@@ -20,6 +20,7 @@
 #ifndef SPSCRING_SPSCRING_HPP
 #define SPSCRING_SPSCRING_HPP
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <new>
@@ -93,10 +94,16 @@ class ring {
 
     /// An instantaneous count. Both threads may call it; by the time it returns
     /// it is already history, so it is for metrics and never for control flow.
+    ///
+    /// A third thread may call it as well, and always gets a value in
+    /// [0, Capacity]. read_ only grows and never passes write_, so loading it
+    /// before write_ keeps the difference non-negative for any observer, and the
+    /// clamp covers an observer whose two loads straddle a pop followed by a
+    /// push. For the producer and the consumer the result is exact.
     [[nodiscard]] std::size_t size() const noexcept {
-        const std::size_t write = write_.load(std::memory_order_acquire);
         const std::size_t read = read_.load(std::memory_order_acquire);
-        return write - read;
+        const std::size_t write = write_.load(std::memory_order_acquire);
+        return std::min(write - read, Capacity);
     }
 
     [[nodiscard]] bool empty() const noexcept { return size() == 0; }
