@@ -63,6 +63,19 @@ two, the eventual wrap of the counter itself stays aligned to the capacity —
 which is the difference between a queue that is correct after 2^64 operations
 and one that reorders exactly once.
 
+## The separation between the indices
+
+The two indices sit 128 bytes apart on aarch64 and x86-64, and 64 bytes apart
+elsewhere. 64 is the number everybody writes down and it is too small on both
+of the architectures this is likely to run on: Apple M-series cores have
+128-byte lines (`hw.cachelinesize` reports 128 on an M2), and x86-64's
+adjacent-line prefetcher fetches lines in pairs, so two indices in neighbouring
+64-byte lines still travel together.
+
+Define `SPSCRING_CACHE_LINE` to override the choice. A value that is not a power
+of two, or smaller than `alignof(std::atomic<std::size_t>)`, is a compile error
+rather than a silently worse layout.
+
 ## What it is not
 
 **Not multi-producer or multi-consumer.** Two producers will corrupt it. The
@@ -80,13 +93,13 @@ variant. It is a correct baseline you can read in one sitting.
 
 | | |
 |---|---|
-| Implemented | bounded ring for one producer and one consumer, move-through, power-of-two capacity, cache-line separated indices, instantaneous `size` for metrics, safe to sample from a third thread |
+| Implemented | bounded ring for one producer and one consumer, move-through, power-of-two capacity, indices on cache lines of their own (128 bytes on aarch64 and x86-64, overridable), instantaneous `size` for metrics, safe to sample from a third thread |
 | Not yet | batch push and pop, a blocking wrapper with futex-style waiting, a heap-allocated runtime-capacity variant |
 
 ## Development
 
 ```bash
-make test   # 2038 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make test   # 2040 checks under AddressSanitizer and UndefinedBehaviorSanitizer
 make race   # the same suite under ThreadSanitizer
 make demo   # one million messages through a 4096-slot queue
 ```

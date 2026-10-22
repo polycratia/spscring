@@ -202,11 +202,17 @@ void a_watching_thread_never_sees_more_than_capacity() {
 }
 
 void the_indices_do_not_share_a_cache_line() {
-    spscring::ring<int, 4> q;
-    // Not a behavioural test — a layout one. If these ever land within 64 bytes
-    // of each other the queue is still correct and much slower, which is the
-    // kind of regression nobody notices.
-    CHECK(sizeof(q) >= 128);
+    using small_ring = spscring::ring<int, 4>;
+    // Not a behavioural test - a layout one. Each index and the slots get a
+    // line of their own, so the whole object is three lines wide and aligned to
+    // one. A size that merely clears 128 bytes says nothing: the broken layout
+    // was 192 bytes with the two indices 64 apart, inside one 128-byte line.
+    CHECK(sizeof(small_ring) == 3 * spscring::detail::cache_line);
+    CHECK(alignof(small_ring) == spscring::detail::cache_line);
+#if !defined(SPSCRING_CACHE_LINE) && (defined(__aarch64__) || defined(__x86_64__))
+    // Apple M-series lines are 128 bytes, and x86-64 fetches lines in pairs.
+    CHECK(spscring::detail::cache_line == 128);
+#endif
 }
 
 }  // namespace

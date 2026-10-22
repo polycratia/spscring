@@ -32,13 +32,29 @@ namespace spscring {
 
 namespace detail {
 
+constexpr bool is_power_of_two(std::size_t n) noexcept { return n != 0 && (n & (n - 1)) == 0; }
+
 // Two indices written by two different threads must not share a cache line, or
 // each write invalidates the other's line and the queue spends its time on
-// coherency traffic. 64 covers every current mainstream CPU; std::hardware_-
-// destructive_interference_size would be better but is inconsistently available.
+// coherency traffic.
+//
+// 64 is not the universal answer. Apple M-series cores have 128-byte lines
+// (hw.cachelinesize reports 128 on an M2), and on x86-64 the adjacent-line
+// prefetcher fetches lines in pairs, so two indices in neighbouring 64-byte
+// lines still travel together. Both architectures therefore get 128, and
+// everything else keeps 64. std::hardware_destructive_interference_size would
+// answer this for us but is inconsistently available.
+#if defined(SPSCRING_CACHE_LINE)
+constexpr std::size_t cache_line = SPSCRING_CACHE_LINE;
+#elif defined(__aarch64__) || defined(__x86_64__)
+constexpr std::size_t cache_line = 128;
+#else
 constexpr std::size_t cache_line = 64;
+#endif
 
-constexpr bool is_power_of_two(std::size_t n) noexcept { return n != 0 && (n & (n - 1)) == 0; }
+static_assert(is_power_of_two(cache_line), "SPSCRING_CACHE_LINE must be a power of two");
+static_assert(cache_line >= alignof(std::atomic<std::size_t>),
+              "SPSCRING_CACHE_LINE must be at least alignof(std::atomic<std::size_t>)");
 
 }  // namespace detail
 
