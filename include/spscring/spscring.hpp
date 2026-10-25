@@ -96,16 +96,23 @@ class ring {
 
     /// Called only by the consuming thread.
     [[nodiscard]] std::optional<T> try_pop() {
+        // The result is built before the slot is handed back, and every path
+        // returns the same named object, so the element is moved exactly once
+        // and NRVO keeps it that way. A second move after the release store
+        // would, if it threw, destroy an element the queue already counts as
+        // popped.
+        std::optional<T> out;
+
         const std::size_t read = read_.load(std::memory_order_relaxed);
         const std::size_t write = write_.load(std::memory_order_acquire);
 
-        if (write == read) return std::nullopt;  // empty
-
-        T value = std::move(slots_[read & (Capacity - 1)]);
-        // Release: the producer may reuse this slot as soon as it sees the new
-        // index, and it must not do so before our move has finished.
-        read_.store(read + 1, std::memory_order_release);
-        return value;
+        if (read != write) {  // not empty
+            out.emplace(std::move(slots_[read & (Capacity - 1)]));
+            // Release: the producer may reuse this slot as soon as it sees the
+            // new index, and it must not do so before our move has finished.
+            read_.store(read + 1, std::memory_order_release);
+        }
+        return out;
     }
 
     /// An instantaneous count. Both threads may call it; by the time it returns

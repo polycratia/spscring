@@ -49,7 +49,10 @@ advertises it. Swapping those two lines is the classic bug, and it is invisible
 on x86.
 
 The consumer is the mirror image: its release on `read_` is what stops the
-producer reusing a slot before the move out of it has finished.
+producer reusing a slot before the move out of it has finished. It moves the
+element exactly once, straight into the `std::optional` it returns, and only
+then advances `read_` — so an element whose move throws is still queued, rather
+than destroyed by a queue that has already counted it as popped.
 
 `size()` loads `read_` first, `write_` second, and clamps the difference to the
 capacity. A monitoring thread's two loads can straddle a pop followed by a push;
@@ -93,13 +96,13 @@ variant. It is a correct baseline you can read in one sitting.
 
 | | |
 |---|---|
-| Implemented | bounded ring for one producer and one consumer, move-through, power-of-two capacity, indices on cache lines of their own (128 bytes on aarch64 and x86-64, overridable), instantaneous `size` for metrics, safe to sample from a third thread |
+| Implemented | bounded ring for one producer and one consumer, move-through with a single move out per element, power-of-two capacity, indices on cache lines of their own (128 bytes on aarch64 and x86-64, overridable), instantaneous `size` for metrics, safe to sample from a third thread |
 | Not yet | batch push and pop, a blocking wrapper with futex-style waiting, a heap-allocated runtime-capacity variant |
 
 ## Development
 
 ```bash
-make test   # 2040 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make test   # 2053 checks under AddressSanitizer and UndefinedBehaviorSanitizer
 make race   # the same suite under ThreadSanitizer
 make demo   # one million messages through a 4096-slot queue
 ```

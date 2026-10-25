@@ -3,7 +3,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
+#include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "harness.hpp"
@@ -57,6 +60,9 @@ void it_wraps_many_times() {
     CHECK(q.empty());
 }
 
+// One move assignment into the slot on the way in, one move construction out
+// of it on the way out. Any more than that is a move the caller is paying for
+// and cannot see.
 void it_moves_rather_than_copies() {
     struct counted {
         int value = 0;
@@ -78,7 +84,81 @@ void it_moves_rather_than_copies() {
     const auto out = q.try_pop();
     CHECK(out.has_value());
     CHECK(out->value == 7);
-    CHECK(out->moves > 0);
+    CHECK(out->moves == 2);
+}
+
+// A move constructor that runs out of permission, so a test can ask what the
+// queue has already published by the time the move throws. Move assignment
+// stays noexcept, which is what the queue itself requires.
+int move_budget = 0;
+
+struct fragile {
+    int value = 0;
+    fragile() = default;
+    explicit fragile(int v) : value(v) {}
+    fragile(fragile&& other) : value(other.value) {
+        if (move_budget == 0) throw std::runtime_error("no moves left");
+        --move_budget;
+    }
+    fragile& operator=(fragile&& other) noexcept {
+        value = other.value;
+        return *this;
+    }
+    fragile(const fragile&) = delete;
+    fragile& operator=(const fragile&) = delete;
+};
+
+// try_pop moves the element out of the slot exactly once, and does it before
+// the release store that hands the slot back. A move that throws therefore
+// leaves the element queued, where a second move after the store would throw
+// with the queue already counting the element as popped - and lose it.
+void a_failed_move_leaves_the_element_queued() {
+    spscring::ring<fragile, 4> queued;
+    fragile zero{0};
+    fragile one{1};
+    CHECK(queued.try_push(std::move(zero)));
+    CHECK(queued.try_push(std::move(one)));
+
+    // One move is a pop's whole budget, and all a pop should need.
+    move_budget = 1;
+    bool moved_once = true;
+    try {
+        const std::optional<fragile> first = queued.try_pop();
+        CHECK(first.has_value() && first->value == 0);
+    } catch (const std::runtime_error&) {
+        moved_once = false;
+    }
+    CHECK(moved_once);
+    CHECK(queued.size() == 1);
+
+    move_budget = 1;
+    const std::optional<fragile> second = queued.try_pop();
+    CHECK(second.has_value() && second->value == 1);
+    CHECK(queued.empty());
+
+    // No budget at all: the move throws while the element still belongs to the
+    // queue, so both are still there and a retry gets the first one.
+    spscring::ring<fragile, 4> stuck;
+    fragile zero_again{0};
+    fragile one_again{1};
+    CHECK(stuck.try_push(std::move(zero_again)));
+    CHECK(stuck.try_push(std::move(one_again)));
+
+    move_budget = 0;
+    bool threw = false;
+    try {
+        const std::optional<fragile> nothing = stuck.try_pop();
+        CHECK(!nothing.has_value());  // not reached: the move had no budget
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(stuck.size() == 2);
+
+    move_budget = 1;
+    const std::optional<fragile> retried = stuck.try_pop();
+    CHECK(retried.has_value() && retried->value == 0);
+    CHECK(stuck.size() == 1);
 }
 
 // The test that matters, and the one people skip: two real threads, every
@@ -223,6 +303,7 @@ int main() {
     a_full_queue_refuses();
     it_wraps_many_times();
     it_moves_rather_than_copies();
+    a_failed_move_leaves_the_element_queued();
     two_threads_lose_nothing_and_reorder_nothing();
     a_tiny_queue_still_carries_everything();
     a_watching_thread_never_sees_more_than_capacity();
