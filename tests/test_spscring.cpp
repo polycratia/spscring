@@ -1,5 +1,6 @@
 #include "spscring/spscring.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +11,21 @@
 #include <vector>
 
 #include "harness.hpp"
+
+// The header declares this template and defines it nowhere, so the definition
+// below is the only one that exists and it exists only here.
+namespace spscring::detail {
+
+template <typename Ring>
+struct test_access {
+    // Called before any thread touches the ring, so relaxed stores are enough.
+    static void start_indices_at(Ring& queue, std::size_t index) {
+        queue.write_.store(index, std::memory_order_relaxed);
+        queue.read_.store(index, std::memory_order_relaxed);
+    }
+};
+
+}  // namespace spscring::detail
 
 namespace {
 
@@ -58,6 +74,73 @@ void it_wraps_many_times() {
         CHECK(value == round);
     }
     CHECK(q.empty());
+}
+
+// The counter itself wraps at 2^64, and a capacity that is not a power of two
+// would put that wrap in the middle of a lap of the slots and reorder the queue
+// exactly once. Reaching the wrap honestly takes 2^64 pushes, so the indices
+// start six short of it instead, and the queue then runs bursts of four, three,
+// two and one straight through it.
+void it_survives_the_counter_wrap() {
+    using small_ring = spscring::ring<int, 4>;
+    constexpr std::size_t start = SIZE_MAX - 5;
+    // The index after n operations is start + n, which is below start once the
+    // counter has gone round.
+    const auto past_the_wrap = [](int operations) {
+        return start + static_cast<std::size_t>(operations) < start;
+    };
+
+    small_ring q;
+    spscring::detail::test_access<small_ring>::start_indices_at(q, start);
+    CHECK(q.empty());
+
+    constexpr int total = 32;
+    constexpr int burst_sizes[] = {4, 3, 2, 1};
+
+    int pushed = 0;
+    int popped = 0;
+    int refusals_before_the_wrap = 0;
+    int refusals_after_the_wrap = 0;
+    int counts_across_the_wrap = 0;
+
+    for (int burst_index = 0; popped < total; ++burst_index) {
+        const int burst = std::min(burst_sizes[burst_index % 4], total - pushed);
+
+        for (int i = 0; i < burst; ++i) CHECK(q.try_push(pushed++));
+        CHECK(q.size() == static_cast<std::size_t>(burst));
+
+        if (past_the_wrap(pushed) && !past_the_wrap(popped)) {
+            // write_ has passed 0 and read_ has not, so size() subtracts a huge
+            // index from a tiny one. Unsigned arithmetic makes that the true
+            // count, not a number near 2^64.
+            CHECK(q.size() == static_cast<std::size_t>(burst));
+            ++counts_across_the_wrap;
+        }
+
+        if (burst == static_cast<int>(q.capacity())) {
+            // Full on both sides of the wrap means refusing on both sides.
+            CHECK(!q.try_push(-1));
+            if (past_the_wrap(pushed)) {
+                ++refusals_after_the_wrap;
+            } else {
+                ++refusals_before_the_wrap;
+            }
+        }
+
+        for (int i = 0; i < burst; ++i) {
+            const auto value = q.try_pop();
+            CHECK(value == popped++);
+        }
+        CHECK(q.size() == 0);
+    }
+
+    CHECK(q.empty());
+    // The run is worthless if it never reached the wrap, or reached it with the
+    // queue empty on both occasions it mattered.
+    CHECK(past_the_wrap(pushed));
+    CHECK(refusals_before_the_wrap >= 1);
+    CHECK(refusals_after_the_wrap >= 1);
+    CHECK(counts_across_the_wrap >= 1);
 }
 
 // One move assignment into the slot on the way in, one move construction out
@@ -302,6 +385,7 @@ int main() {
     it_keeps_order();
     a_full_queue_refuses();
     it_wraps_many_times();
+    it_survives_the_counter_wrap();
     it_moves_rather_than_copies();
     a_failed_move_leaves_the_element_queued();
     two_threads_lose_nothing_and_reorder_nothing();

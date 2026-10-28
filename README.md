@@ -64,7 +64,14 @@ exact answer.
 Indices count forever and are masked at use. Because the capacity is a power of
 two, the eventual wrap of the counter itself stays aligned to the capacity —
 which is the difference between a queue that is correct after 2^64 operations
-and one that reorders exactly once.
+and one that reorders exactly once. `it_survives_the_counter_wrap` is that
+claim as a test: it starts both indices at `SIZE_MAX - 5` and runs 32 elements
+through bursts of four, three, two and one, checking every value out, the
+refusal of a fifth push into a full queue on each side of the wrap, and the
+count in the state where the write index has passed zero and the read index has
+not. The header declares `detail::test_access` and defines it nowhere, so the
+test can place the indices there and a build that is not the test suite gains
+no API.
 
 ## The separation between the indices
 
@@ -96,13 +103,13 @@ variant. It is a correct baseline you can read in one sitting.
 
 | | |
 |---|---|
-| Implemented | bounded ring for one producer and one consumer, move-through with a single move out per element, power-of-two capacity, indices on cache lines of their own (128 bytes on aarch64 and x86-64, overridable), instantaneous `size` for metrics, safe to sample from a third thread |
+| Implemented | bounded ring for one producer and one consumer, move-through with a single move out per element, power-of-two capacity, indices on cache lines of their own (128 bytes on aarch64 and x86-64, overridable), instantaneous `size` for metrics, safe to sample from a third thread, order kept across the 2^64 index wrap |
 | Not yet | batch push and pop, a blocking wrapper with futex-style waiting, a heap-allocated runtime-capacity variant |
 
 ## Development
 
 ```bash
-make test   # 2053 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make test   # 2153 checks under AddressSanitizer and UndefinedBehaviorSanitizer
 make race   # the same suite under ThreadSanitizer
 make demo   # one million messages through a 4096-slot queue
 ```

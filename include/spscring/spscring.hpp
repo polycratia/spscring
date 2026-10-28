@@ -56,6 +56,12 @@ static_assert(is_power_of_two(cache_line), "SPSCRING_CACHE_LINE must be a power 
 static_assert(cache_line >= alignof(std::atomic<std::size_t>),
               "SPSCRING_CACHE_LINE must be at least alignof(std::atomic<std::size_t>)");
 
+// Declared and never defined. A test can write the definition and start the
+// indices anywhere it likes - just below their wrap, say, which is otherwise
+// 2^64 pushes away - while a build that does not define it gains no way in.
+template <typename Ring>
+struct test_access;
+
 }  // namespace detail
 
 /// A bounded queue for exactly one producing thread and one consuming thread.
@@ -133,6 +139,8 @@ class ring {
     [[nodiscard]] bool full() const noexcept { return size() == Capacity; }
 
   private:
+    friend struct detail::test_access<ring>;
+
     // Indices count forever and are masked at use. Subtraction is correct
     // across the unsigned wrap, and because the capacity is a power of two the
     // wrap does not shift the alignment.
