@@ -69,21 +69,36 @@ struct test_access;
 /// Capacity must be a power of two: the indices then wrap by masking, and a
 /// wrap of the counter itself stays aligned to the capacity, which is what
 /// keeps the queue correct after 2^64 operations instead of subtly wrong.
+///
+/// An element lives from its push to its pop: constructed in place in a slot,
+/// destroyed as it leaves. T therefore needs no default constructor, and a
+/// ring holds no T until something is pushed into it.
 template <typename T, std::size_t Capacity>
 class ring {
     static_assert(detail::is_power_of_two(Capacity), "capacity must be a power of two");
-    static_assert(std::is_nothrow_move_assignable_v<T> || std::is_copy_assignable_v<T>,
-                  "elements must be assignable without throwing across the queue boundary");
+    static_assert(std::is_move_constructible_v<T>,
+                  "elements must be move constructible: try_pop moves them out of their slot");
+    static_assert(std::is_nothrow_destructible_v<T>,
+                  "elements must be destructible without throwing: the queue destroys them");
 
   public:
     ring() = default;
     ring(const ring&) = delete;
     ring& operator=(const ring&) = delete;
 
+    /// Destroys whatever is still queued. There is no synchronisation here and
+    /// none is possible, so this may run only once both threads have been
+    /// joined and nobody is pushing or popping any more.
+    ~ring() {
+        const std::size_t read = read_.load(std::memory_order_relaxed);
+        const std::size_t write = write_.load(std::memory_order_relaxed);
+        for (std::size_t index = read; index != write; ++index) slot(index)->~T();
+    }
+
     [[nodiscard]] static constexpr std::size_t capacity() noexcept { return Capacity; }
 
     /// Called only by the producing thread.
-    template <typename U>
+    template <typename U, typename = std::enable_if_t<std::is_constructible_v<T, U&&>>>
     [[nodiscard]] bool try_push(U&& value) {
         // Our own index: nobody else writes it, so a relaxed load is enough.
         const std::size_t write = write_.load(std::memory_order_relaxed);
@@ -93,7 +108,10 @@ class ring {
 
         if (write - read == Capacity) return false;  // full
 
-        slots_[write & (Capacity - 1)] = std::forward<U>(value);
+        // The slot is raw storage, and the consumer destroyed whatever used to
+        // live there before it handed the slot back, so this constructs rather
+        // than assigns.
+        ::new (raw_slot(write)) T(std::forward<U>(value));
         // Release: the element must be visible to the consumer before the index
         // that advertises it. Reversing these two lines is the classic bug.
         write_.store(write + 1, std::memory_order_release);
@@ -113,9 +131,14 @@ class ring {
         const std::size_t write = write_.load(std::memory_order_acquire);
 
         if (read != write) {  // not empty
-            out.emplace(std::move(slots_[read & (Capacity - 1)]));
+            T* const element = slot(read);
+            out.emplace(std::move(*element));
+            // The element's life ends here, not at the next push into this
+            // slot: a popped element holds nothing once the caller has it.
+            element->~T();
             // Release: the producer may reuse this slot as soon as it sees the
-            // new index, and it must not do so before our move has finished.
+            // new index, and it must not do so before the move and this
+            // destructor have finished.
             read_.store(read + 1, std::memory_order_release);
         }
         return out;
@@ -141,12 +164,26 @@ class ring {
   private:
     friend struct detail::test_access<ring>;
 
+    static constexpr std::size_t slot_alignment = std::max(detail::cache_line, alignof(T));
+
+    [[nodiscard]] void* raw_slot(std::size_t index) noexcept {
+        return slots_ + (index & (Capacity - 1)) * sizeof(T);
+    }
+
+    [[nodiscard]] T* slot(std::size_t index) noexcept {
+        return std::launder(reinterpret_cast<T*>(raw_slot(index)));
+    }
+
     // Indices count forever and are masked at use. Subtraction is correct
     // across the unsigned wrap, and because the capacity is a power of two the
     // wrap does not shift the alignment.
     alignas(detail::cache_line) std::atomic<std::size_t> write_{0};
     alignas(detail::cache_line) std::atomic<std::size_t> read_{0};
-    alignas(detail::cache_line) T slots_[Capacity]{};
+    // Raw storage rather than an array of T: the queue owns a slot's bytes for
+    // its whole life and the element in them only from a push to a pop. The
+    // alignment keeps the slots off the indices' lines and every slot aligned
+    // for T.
+    alignas(slot_alignment) unsigned char slots_[Capacity * sizeof(T)];
 };
 
 }  // namespace spscring

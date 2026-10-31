@@ -40,7 +40,7 @@ Header-only, C++17, no allocation after construction, no exceptions.
 // push
 const auto write = write_.load(std::memory_order_relaxed);  // ours; nobody else writes it
 const auto read  = read_.load(std::memory_order_acquire);   // theirs; must see their progress
-slots_[write & mask] = value;
+::new (raw_slot(write)) T(std::forward<U>(value));          // built in the slot
 write_.store(write + 1, std::memory_order_release);         // element visible before the index
 ```
 
@@ -50,9 +50,10 @@ on x86.
 
 The consumer is the mirror image: its release on `read_` is what stops the
 producer reusing a slot before the move out of it has finished. It moves the
-element exactly once, straight into the `std::optional` it returns, and only
-then advances `read_` — so an element whose move throws is still queued, rather
-than destroyed by a queue that has already counted it as popped.
+element exactly once, straight into the `std::optional` it returns, destroys
+what is left in the slot, and only then advances `read_` — so an element whose
+move throws is still queued, rather than destroyed by a queue that has already
+counted it as popped.
 
 `size()` loads `read_` first, `write_` second, and clamps the difference to the
 capacity. A monitoring thread's two loads can straddle a pop followed by a push;
@@ -73,6 +74,19 @@ not. The header declares `detail::test_access` and defines it nowhere, so the
 test can place the indices there and a build that is not the test suite gains
 no API.
 
+## The life of an element
+
+The slots are raw storage, not an array of `T`. Constructing a `ring<T, N>`
+constructs no `T` at all; `try_push` builds one in the slot from its argument,
+and `try_pop` moves it into the `std::optional` it returns and then runs `~T()`
+on the slot. So `T` needs no default constructor, and a popped element gives up
+whatever it held as it leaves, instead of sitting in the slot until some later
+push happens to overwrite it.
+
+The destructor destroys the elements still in `[read_, write_)`. It does that
+with no synchronisation, because none is possible: a queue may be destroyed only
+once both threads are done with it.
+
 ## The separation between the indices
 
 The two indices sit 128 bytes apart on aarch64 and x86-64, and 64 bytes apart
@@ -84,7 +98,8 @@ adjacent-line prefetcher fetches lines in pairs, so two indices in neighbouring
 
 Define `SPSCRING_CACHE_LINE` to override the choice. A value that is not a power
 of two, or smaller than `alignof(std::atomic<std::size_t>)`, is a compile error
-rather than a silently worse layout.
+rather than a silently worse layout. The slots take the larger of that number
+and `alignof(T)`.
 
 ## What it is not
 
@@ -103,13 +118,13 @@ variant. It is a correct baseline you can read in one sitting.
 
 | | |
 |---|---|
-| Implemented | bounded ring for one producer and one consumer, move-through with a single move out per element, power-of-two capacity, indices on cache lines of their own (128 bytes on aarch64 and x86-64, overridable), instantaneous `size` for metrics, safe to sample from a third thread, order kept across the 2^64 index wrap |
+| Implemented | bounded ring for one producer and one consumer, elements constructed on push and destroyed on pop, a single move out per element, no default constructor required of `T`, power-of-two capacity, indices on cache lines of their own (128 bytes on aarch64 and x86-64, overridable), instantaneous `size` for metrics, safe to sample from a third thread, order kept across the 2^64 index wrap |
 | Not yet | batch push and pop, a blocking wrapper with futex-style waiting, a heap-allocated runtime-capacity variant |
 
 ## Development
 
 ```bash
-make test   # 2153 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make test   # 2167 checks under AddressSanitizer and UndefinedBehaviorSanitizer
 make race   # the same suite under ThreadSanitizer
 make demo   # one million messages through a 4096-slot queue
 ```

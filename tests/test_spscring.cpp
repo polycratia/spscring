@@ -7,6 +7,7 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -143,21 +144,15 @@ void it_survives_the_counter_wrap() {
     CHECK(counts_across_the_wrap >= 1);
 }
 
-// One move assignment into the slot on the way in, one move construction out
+// One move construction into the slot on the way in, one move construction out
 // of it on the way out. Any more than that is a move the caller is paying for
 // and cannot see.
 void it_moves_rather_than_copies() {
     struct counted {
         int value = 0;
         int moves = 0;
-        counted() = default;
         explicit counted(int v) : value(v) {}
         counted(counted&& other) noexcept : value(other.value), moves(other.moves + 1) {}
-        counted& operator=(counted&& other) noexcept {
-            value = other.value;
-            moves = other.moves + 1;
-            return *this;
-        }
         counted(const counted&) = delete;
         counted& operator=(const counted&) = delete;
     };
@@ -170,22 +165,74 @@ void it_moves_rather_than_copies() {
     CHECK(out->moves == 2);
 }
 
+// A type that counts how many of itself are alive, so a test can ask when the
+// queue builds an element and when it takes it apart.
+struct tracked {
+    static int live;
+    int value = 0;
+    explicit tracked(int v) : value(v) { ++live; }
+    tracked(tracked&& other) noexcept : value(other.value) { ++live; }
+    tracked(const tracked&) = delete;
+    tracked& operator=(const tracked&) = delete;
+    ~tracked() { --live; }
+};
+
+int tracked::live = 0;
+
+// An element lives from its push to its pop. The slots are raw storage, so a
+// fresh ring holds nothing, and a popped element is destroyed as it leaves
+// rather than lingering in its slot until some later push overwrites it.
+void an_element_lives_from_push_to_pop() {
+    tracked::live = 0;
+    {
+        spscring::ring<tracked, 4> q;
+        CHECK(tracked::live == 0);  // constructing the ring constructs no T
+
+        for (int i = 0; i < 3; ++i) CHECK(q.try_push(tracked{i}));
+        CHECK(tracked::live == 3);  // the three temporaries are gone; the queue's three are not
+
+        {
+            const auto first = q.try_pop();
+            CHECK(first.has_value() && first->value == 0);
+            CHECK(tracked::live == 3);  // two queued and the one in hand
+        }
+        CHECK(tracked::live == 2);  // the popped slot holds nothing
+        CHECK(q.size() == 2);
+    }
+    CHECK(tracked::live == 0);  // destroying a queue destroys what is in it
+}
+
+// Nothing in the queue default-constructs a T, so a type without a default
+// constructor is a type the queue can carry.
+struct no_default {
+    int value;
+    explicit no_default(int v) : value(v) {}
+    no_default(no_default&&) noexcept = default;
+};
+
+static_assert(!std::is_default_constructible_v<no_default>,
+              "the point of this type is that it has no default constructor");
+
+void a_type_without_a_default_constructor_makes_the_round_trip() {
+    spscring::ring<no_default, 4> q;
+    CHECK(q.try_push(no_default{7}));
+    const auto out = q.try_pop();
+    CHECK(out.has_value());
+    CHECK(out->value == 7);
+    CHECK(q.empty());
+}
+
 // A move constructor that runs out of permission, so a test can ask what the
-// queue has already published by the time the move throws. Move assignment
-// stays noexcept, which is what the queue itself requires.
+// queue has already published by the time the move throws. Both a push and a
+// pop move-construct, so each costs one unit of the budget.
 int move_budget = 0;
 
 struct fragile {
     int value = 0;
-    fragile() = default;
     explicit fragile(int v) : value(v) {}
     fragile(fragile&& other) : value(other.value) {
         if (move_budget == 0) throw std::runtime_error("no moves left");
         --move_budget;
-    }
-    fragile& operator=(fragile&& other) noexcept {
-        value = other.value;
-        return *this;
     }
     fragile(const fragile&) = delete;
     fragile& operator=(const fragile&) = delete;
@@ -197,10 +244,9 @@ struct fragile {
 // with the queue already counting the element as popped - and lose it.
 void a_failed_move_leaves_the_element_queued() {
     spscring::ring<fragile, 4> queued;
-    fragile zero{0};
-    fragile one{1};
-    CHECK(queued.try_push(std::move(zero)));
-    CHECK(queued.try_push(std::move(one)));
+    move_budget = 2;  // one construction into a slot per push
+    CHECK(queued.try_push(fragile{0}));
+    CHECK(queued.try_push(fragile{1}));
 
     // One move is a pop's whole budget, and all a pop should need.
     move_budget = 1;
@@ -222,10 +268,9 @@ void a_failed_move_leaves_the_element_queued() {
     // No budget at all: the move throws while the element still belongs to the
     // queue, so both are still there and a retry gets the first one.
     spscring::ring<fragile, 4> stuck;
-    fragile zero_again{0};
-    fragile one_again{1};
-    CHECK(stuck.try_push(std::move(zero_again)));
-    CHECK(stuck.try_push(std::move(one_again)));
+    move_budget = 2;
+    CHECK(stuck.try_push(fragile{0}));
+    CHECK(stuck.try_push(fragile{1}));
 
     move_budget = 0;
     bool threw = false;
@@ -387,6 +432,8 @@ int main() {
     it_wraps_many_times();
     it_survives_the_counter_wrap();
     it_moves_rather_than_copies();
+    an_element_lives_from_push_to_pop();
+    a_type_without_a_default_constructor_makes_the_round_trip();
     a_failed_move_leaves_the_element_queued();
     two_threads_lose_nothing_and_reorder_nothing();
     a_tiny_queue_still_carries_everything();
