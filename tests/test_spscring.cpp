@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -289,6 +290,158 @@ void a_failed_move_leaves_the_element_queued() {
     CHECK(stuck.size() == 1);
 }
 
+// A batch lands in consecutive slots and wraps past the end of the array, so
+// the batch worth testing is the one that straddles it: both halves have to
+// come back in the order they went in.
+void a_batch_straddling_the_end_keeps_order() {
+    spscring::ring<int, 8> q;
+
+    // Bring both indices to 6, so a batch of seven covers slots 6, 7, 0, 1, 2,
+    // 3 and 4.
+    const int warmup[] = {0, 1, 2, 3, 4, 5};
+    int drained[6] = {};
+    CHECK(q.try_push_n(std::begin(warmup), 6) == 6);
+    CHECK(q.try_pop_n(drained, 6) == 6);
+    CHECK(drained[5] == 5);
+    CHECK(q.empty());
+
+    const int batch[] = {10, 11, 12, 13, 14, 15, 16};
+    CHECK(q.try_push_n(std::begin(batch), 7) == 7);
+    CHECK(q.size() == 7);
+
+    std::vector<int> out;
+    CHECK(q.try_pop_n(std::back_inserter(out), 7) == 7);
+    CHECK(out.size() == 7);
+    for (std::size_t i = 0; i < 7; ++i) CHECK(i < out.size() && out[i] == batch[i]);
+    CHECK(q.empty());
+}
+
+// A batch push takes the room there is and says how much that was. A full queue
+// has none, and neither a refused batch nor a zero-length call stores to an
+// index.
+void a_full_queue_returns_zero_from_a_batch_push() {
+    spscring::ring<int, 4> q;
+    const int values[] = {0, 1, 2, 3, 4, 5};
+    int out[4] = {};
+
+    CHECK(q.try_push_n(std::begin(values), 6) == 4);  // asked for six, took four
+    CHECK(q.full());
+    CHECK(q.try_push_n(std::begin(values), 2) == 0);
+    CHECK(q.size() == 4);
+    CHECK(q.try_push_n(std::begin(values), 0) == 0);
+    CHECK(q.try_pop_n(out, 0) == 0);
+    CHECK(q.size() == 4);
+
+    CHECK(q.try_pop_n(out, 10) == 4);  // asked for ten, got what was there
+    for (int i = 0; i < 4; ++i) CHECK(out[i] == i);
+    CHECK(q.empty());
+    CHECK(q.try_pop_n(out, 4) == 0);
+}
+
+// A copy constructor that runs out of permission on its third use, so a test
+// can ask what a half-built batch left behind.
+int construction_budget = 0;
+
+struct brittle {
+    static int live;
+    int value = 0;
+    explicit brittle(int v) : value(v) { ++live; }
+    brittle(const brittle& other) : value(other.value) {
+        if (construction_budget == 0) throw std::runtime_error("no constructions left");
+        --construction_budget;
+        ++live;
+    }
+    brittle& operator=(const brittle&) = delete;
+    ~brittle() { --live; }
+};
+
+int brittle::live = 0;
+
+// A batch is all or nothing: the elements already built in the throwing call
+// are destroyed and write_ never moves, so the consumer sees neither a short
+// batch nor a slot it should not touch.
+void a_throwing_construction_leaves_the_batch_unpublished() {
+    brittle::live = 0;
+    {
+        spscring::ring<brittle, 8> q;
+        std::vector<brittle> source;
+        source.reserve(5);  // no reallocation, so only the int constructor runs
+        for (int i = 0; i < 5; ++i) source.emplace_back(i);
+        CHECK(brittle::live == 5);
+
+        construction_budget = 2;  // the third construction throws
+        bool threw = false;
+        try {
+            const std::size_t pushed = q.try_push_n(source.begin(), 5);
+            CHECK(pushed == 0);  // not reached
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        CHECK(threw);
+        CHECK(q.size() == 0);
+        CHECK(q.empty());
+        CHECK(brittle::live == 5);  // the two that were built are gone again
+        CHECK(!q.try_pop().has_value());
+
+        // The queue is untouched rather than wounded: the same batch goes
+        // through once there is budget for it.
+        construction_budget = 5;
+        CHECK(q.try_push_n(source.begin(), 5) == 5);
+        CHECK(q.size() == 5);
+        CHECK(brittle::live == 10);
+    }
+    CHECK(brittle::live == 0);
+}
+
+// An output iterator that runs out of permission, so a test can ask which
+// elements the queue has given up by the time the handover throws.
+int handovers_allowed = 0;
+
+struct brittle_sink {
+    using iterator_category = std::output_iterator_tag;
+    using value_type = void;
+    using difference_type = std::ptrdiff_t;
+    using pointer = void;
+    using reference = void;
+
+    std::vector<int>* received = nullptr;
+
+    brittle_sink& operator*() { return *this; }
+    brittle_sink& operator++() { return *this; }
+    brittle_sink& operator=(int value) {
+        if (handovers_allowed == 0) throw std::runtime_error("no room left");
+        --handovers_allowed;
+        received->push_back(value);
+        return *this;
+    }
+};
+
+// An element written to out has left the queue, so the one store on the way out
+// has to release exactly those - no more, so nothing is delivered twice, and no
+// fewer, so nothing is counted as queued that the caller already holds.
+void a_throwing_handover_releases_only_what_was_taken() {
+    spscring::ring<int, 8> q;
+    const int values[] = {0, 1, 2, 3, 4};
+    CHECK(q.try_push_n(std::begin(values), 5) == 5);
+
+    std::vector<int> taken;
+    handovers_allowed = 2;  // the third handover throws
+    bool threw = false;
+    try {
+        const std::size_t popped = q.try_pop_n(brittle_sink{&taken}, 5);
+        CHECK(popped == 0);  // not reached
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(taken.size() == 2);
+    CHECK(taken.size() == 2 && taken.front() == 0);
+    CHECK(taken.size() == 2 && taken.back() == 1);
+    CHECK(q.size() == 3);  // the two handed over are gone, the third still queued
+    CHECK(q.try_pop() == 2);
+    CHECK(q.size() == 2);
+}
+
 // The test that matters, and the one people skip: two real threads, every
 // element accounted for, in order.
 void two_threads_lose_nothing_and_reorder_nothing() {
@@ -320,6 +473,63 @@ void two_threads_lose_nothing_and_reorder_nothing() {
         }
         if (*value != static_cast<std::uint32_t>(received)) ordered = false;
         ++received;
+    }
+    producer.join();
+
+    CHECK(received == total);
+    CHECK(ordered);
+    CHECK(q.empty());
+}
+
+// The same claim for batches, with the sizes cycling from 1 to 17 so that every
+// batch falls differently against the slots and the two indices meet in a
+// different place each time.
+void two_threads_carry_batches_in_order() {
+    constexpr int total = 200000;
+    constexpr std::size_t largest_batch = 17;
+    spscring::ring<std::uint32_t, 1024> q;
+
+    std::thread producer([&] {
+        std::vector<std::uint32_t> batch;
+        int next = 0;
+        std::size_t wanted = 1;
+        while (next < total) {
+            const std::size_t count =
+                std::min(wanted, static_cast<std::size_t>(total - next));
+            batch.clear();
+            for (std::size_t i = 0; i < count; ++i) {
+                batch.push_back(static_cast<std::uint32_t>(next + static_cast<int>(i)));
+            }
+
+            std::size_t sent = 0;
+            while (sent < count) {
+                const std::size_t pushed = q.try_push_n(
+                    std::next(batch.begin(), static_cast<std::ptrdiff_t>(sent)), count - sent);
+                if (pushed == 0) std::this_thread::yield();
+                sent += pushed;
+            }
+
+            next += static_cast<int>(count);
+            wanted = wanted == largest_batch ? 1 : wanted + 1;
+        }
+    });
+
+    int received = 0;
+    bool ordered = true;
+    std::vector<std::uint32_t> out;
+    std::size_t wanted = 1;
+    while (received < total) {
+        out.clear();
+        const std::size_t got = q.try_pop_n(std::back_inserter(out), wanted);
+        if (got == 0) {
+            std::this_thread::yield();
+            continue;
+        }
+        for (std::size_t i = 0; i < got; ++i) {
+            if (out[i] != static_cast<std::uint32_t>(received)) ordered = false;
+            ++received;
+        }
+        wanted = wanted == largest_batch ? 1 : wanted + 1;
     }
     producer.join();
 
@@ -435,7 +645,12 @@ int main() {
     an_element_lives_from_push_to_pop();
     a_type_without_a_default_constructor_makes_the_round_trip();
     a_failed_move_leaves_the_element_queued();
+    a_batch_straddling_the_end_keeps_order();
+    a_full_queue_returns_zero_from_a_batch_push();
+    a_throwing_construction_leaves_the_batch_unpublished();
+    a_throwing_handover_releases_only_what_was_taken();
     two_threads_lose_nothing_and_reorder_nothing();
+    two_threads_carry_batches_in_order();
     a_tiny_queue_still_carries_everything();
     a_watching_thread_never_sees_more_than_capacity();
     the_indices_do_not_share_a_cache_line();

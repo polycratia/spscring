@@ -118,6 +118,39 @@ class ring {
         return true;
     }
 
+    /// Builds min(n, free slots) elements in consecutive slots, wrapping past
+    /// the end of the array, and publishes the lot with one release store.
+    /// Returns how many it built; the caller resumes at std::next(first, that).
+    /// A std::move_iterator moves the source elements instead of copying them.
+    ///
+    /// Called only by the producing thread.
+    ///
+    /// One store is the point: a batch that advertised itself once per element
+    /// would be one chance per element for the consumer to see it half built.
+    /// A construction that throws destroys what this call has already built and
+    /// leaves write_ where the consumer last saw it, so the batch either
+    /// happened or did not.
+    template <typename ForwardIt>
+    [[nodiscard]] std::size_t try_push_n(ForwardIt first, std::size_t n) {
+        const std::size_t write = write_.load(std::memory_order_relaxed);
+        const std::size_t read = read_.load(std::memory_order_acquire);
+
+        const std::size_t count = std::min(n, Capacity - (write - read));
+        if (count == 0) return 0;  // nothing asked for, or no room: no store
+
+        std::size_t built = 0;
+        try {
+            for (; built < count; ++built, ++first) ::new (raw_slot(write + built)) T(*first);
+        } catch (...) {
+            while (built-- != 0) slot(write + built)->~T();
+            throw;
+        }
+        // Every element of the batch is visible before the single index that
+        // advertises all of them.
+        write_.store(write + count, std::memory_order_release);
+        return count;
+    }
+
     /// Called only by the consuming thread.
     [[nodiscard]] std::optional<T> try_pop() {
         // The result is built before the slot is handed back, and every path
@@ -142,6 +175,38 @@ class ring {
             read_.store(read + 1, std::memory_order_release);
         }
         return out;
+    }
+
+    /// Moves up to max elements to out, destroying each slot as it goes, and
+    /// hands all of them back with one release store. Returns the count.
+    ///
+    /// Called only by the consuming thread.
+    ///
+    /// An element written to out has left the queue, so a handover that throws
+    /// releases exactly the elements already handed over - with that same
+    /// single store, before the exception leaves - and the element whose
+    /// handover threw stays queued rather than being counted as popped.
+    template <typename OutputIt>
+    [[nodiscard]] std::size_t try_pop_n(OutputIt out, std::size_t max) {
+        const std::size_t read = read_.load(std::memory_order_relaxed);
+        const std::size_t write = write_.load(std::memory_order_acquire);
+
+        const std::size_t count = std::min(max, write - read);
+        if (count == 0) return 0;  // nothing asked for, or empty: no store
+
+        std::size_t moved = 0;
+        try {
+            for (; moved < count; ++moved, ++out) {
+                T* const element = slot(read + moved);
+                *out = std::move(*element);
+                element->~T();
+            }
+        } catch (...) {
+            read_.store(read + moved, std::memory_order_release);
+            throw;
+        }
+        read_.store(read + count, std::memory_order_release);
+        return count;
     }
 
     /// An instantaneous count. Both threads may call it; by the time it returns
