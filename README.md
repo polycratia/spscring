@@ -32,9 +32,13 @@ const std::size_t sent = queue.try_push_n(first, n);   // 0 if full
 // consuming thread
 if (const auto m = queue.try_pop()) { handle(*m); }
 const std::size_t got = queue.try_pop_n(std::back_inserter(batch), 32);
+
+// a capacity known only at start-up
+auto configured = spscring::heap_ring<message>::create(n);   // null unless n is 2^k
 ```
 
-Header-only, C++17, no allocation after construction, no exceptions.
+Header-only, C++17, no exceptions, and no allocation after construction:
+`heap_ring` does its one allocation in `create` and none afterwards.
 
 ## The ordering, in four lines
 
@@ -113,6 +117,31 @@ The destructor destroys the elements still in `[read_, write_)`. It does that
 with no synchronisation, because none is possible: a queue may be destroyed only
 once both threads are done with it.
 
+## A capacity that is not a constant
+
+When the capacity is a configuration value rather than a number in the source,
+`heap_ring<T>::create(capacity)` puts the slots on the heap and hands back a
+`std::unique_ptr`, or null:
+
+```cpp
+auto queue = spscring::heap_ring<message>::create(capacity);
+if (!queue) { /* 0, not a power of two, too large for a size_t, or out of memory */ }
+```
+
+It refuses rather than rounding. A request for 1000 does not become 1024: a
+queue that holds a different number of elements than its owner asked for is a
+queue whose owner's arithmetic is wrong somewhere else, and silence there is
+worse than a null. Nothing on the path throws — the object comes from
+`new (std::nothrow)` and the slots from the aligned `operator new` with
+`std::nothrow` — so a failed allocation is the same null as a bad capacity. The
+slots are allocated once, in `create`, and freed in the destructor after the
+elements still queued are destroyed.
+
+Both types derive from `detail::ring_core`, which owns the two indices and every
+one of the atomic accesses above; the derived class only says how large it is
+and where a slot lives. There is one copy of the ordering, not two, and
+`detail::test_access` reaches the indices of either.
+
 ## The separation between the indices
 
 The two indices sit 128 bytes apart on aarch64 and x86-64, and 64 bytes apart
@@ -144,14 +173,14 @@ correct baseline you can read in one sitting.
 
 | | |
 |---|---|
-| Implemented | bounded ring for one producer and one consumer, elements constructed on push and destroyed on pop, a single move out per element, no default constructor required of `T`, power-of-two capacity, batch push and pop that each publish with one store and wrap past the end of the array, indices on cache lines of their own (128 bytes on aarch64 and x86-64, overridable), instantaneous `size` for metrics, safe to sample from a third thread, order kept across the 2^64 index wrap |
-| Not yet | a blocking wrapper with futex-style waiting, a heap-allocated runtime-capacity variant |
+| Implemented | bounded ring for one producer and one consumer, elements constructed on push and destroyed on pop, a single move out per element, no default constructor required of `T`, power-of-two capacity, a heap-allocated variant whose run-time capacity is checked and never rounded, batch push and pop that each publish with one store and wrap past the end of the array, indices on cache lines of their own (128 bytes on aarch64 and x86-64, overridable), instantaneous `size` for metrics, safe to sample from a third thread, order kept across the 2^64 index wrap |
+| Not yet | a blocking wrapper with futex-style waiting |
 
 ## Development
 
 ```bash
-make test   # 2218 checks under AddressSanitizer and UndefinedBehaviorSanitizer
-make race   # the same suite under ThreadSanitizer
+make test   # 2235 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make race   # the same suites under ThreadSanitizer
 make demo   # one million messages through a 4096-slot queue
 ```
 

@@ -16,13 +16,16 @@
 // This is not a cleverer queue. It is the ordinary one with the reasoning
 // attached, so the next person does not have to re-derive it.
 //
-// Header-only, C++17, no allocation after construction, no exceptions.
+// Header-only, C++17, no exceptions, and no allocation after construction:
+// heap_ring does its one allocation in create and none afterwards.
 #ifndef SPSCRING_SPSCRING_HPP
 #define SPSCRING_SPSCRING_HPP
 
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
+#include <limits>
+#include <memory>
 #include <new>
 #include <optional>
 #include <type_traits>
@@ -56,46 +59,33 @@ static_assert(is_power_of_two(cache_line), "SPSCRING_CACHE_LINE must be a power 
 static_assert(cache_line >= alignof(std::atomic<std::size_t>),
               "SPSCRING_CACHE_LINE must be at least alignof(std::atomic<std::size_t>)");
 
+// Keeps the slots off the indices' lines and every slot aligned for T.
+template <typename T>
+constexpr std::size_t slot_alignment = cache_line > alignof(T) ? cache_line : alignof(T);
+
 // Declared and never defined. A test can write the definition and start the
 // indices anywhere it likes - just below their wrap, say, which is otherwise
 // 2^64 pushes away - while a build that does not define it gains no way in.
 template <typename Ring>
 struct test_access;
 
-}  // namespace detail
-
-/// A bounded queue for exactly one producing thread and one consuming thread.
+/// The two indices, and every atomic access the queue makes, in one place.
 ///
-/// Capacity must be a power of two: the indices then wrap by masking, and a
-/// wrap of the counter itself stays aligned to the capacity, which is what
-/// keeps the queue correct after 2^64 operations instead of subtly wrong.
-///
-/// An element lives from its push to its pop: constructed in place in a slot,
-/// destroyed as it leaves. T therefore needs no default constructor, and a
-/// ring holds no T until something is pushed into it.
-template <typename T, std::size_t Capacity>
-class ring {
-    static_assert(detail::is_power_of_two(Capacity), "capacity must be a power of two");
+/// Derived supplies capacity() and slot(index), which hands back the raw
+/// storage of the slot an index names. Everything else - the push, the pop,
+/// the batches, the count, and the order of each load and store - lives here,
+/// so a compile-time capacity and a run-time one share one copy of the
+/// reasoning rather than two that can drift apart.
+template <typename Derived, typename T>
+class ring_core {
     static_assert(std::is_move_constructible_v<T>,
                   "elements must be move constructible: try_pop moves them out of their slot");
     static_assert(std::is_nothrow_destructible_v<T>,
                   "elements must be destructible without throwing: the queue destroys them");
 
   public:
-    ring() = default;
-    ring(const ring&) = delete;
-    ring& operator=(const ring&) = delete;
-
-    /// Destroys whatever is still queued. There is no synchronisation here and
-    /// none is possible, so this may run only once both threads have been
-    /// joined and nobody is pushing or popping any more.
-    ~ring() {
-        const std::size_t read = read_.load(std::memory_order_relaxed);
-        const std::size_t write = write_.load(std::memory_order_relaxed);
-        for (std::size_t index = read; index != write; ++index) slot(index)->~T();
-    }
-
-    [[nodiscard]] static constexpr std::size_t capacity() noexcept { return Capacity; }
+    ring_core(const ring_core&) = delete;
+    ring_core& operator=(const ring_core&) = delete;
 
     /// Called only by the producing thread.
     template <typename U, typename = std::enable_if_t<std::is_constructible_v<T, U&&>>>
@@ -106,7 +96,7 @@ class ring {
         // publishing that index has to be visible before we reuse the slot.
         const std::size_t read = read_.load(std::memory_order_acquire);
 
-        if (write - read == Capacity) return false;  // full
+        if (write - read == ring_capacity()) return false;  // full
 
         // The slot is raw storage, and the consumer destroyed whatever used to
         // live there before it handed the slot back, so this constructs rather
@@ -135,14 +125,14 @@ class ring {
         const std::size_t write = write_.load(std::memory_order_relaxed);
         const std::size_t read = read_.load(std::memory_order_acquire);
 
-        const std::size_t count = std::min(n, Capacity - (write - read));
+        const std::size_t count = std::min(n, ring_capacity() - (write - read));
         if (count == 0) return 0;  // nothing asked for, or no room: no store
 
         std::size_t built = 0;
         try {
             for (; built < count; ++built, ++first) ::new (raw_slot(write + built)) T(*first);
         } catch (...) {
-            while (built-- != 0) slot(write + built)->~T();
+            while (built-- != 0) element(write + built)->~T();
             throw;
         }
         // Every element of the batch is visible before the single index that
@@ -164,11 +154,11 @@ class ring {
         const std::size_t write = write_.load(std::memory_order_acquire);
 
         if (read != write) {  // not empty
-            T* const element = slot(read);
-            out.emplace(std::move(*element));
+            T* const taken = element(read);
+            out.emplace(std::move(*taken));
             // The element's life ends here, not at the next push into this
             // slot: a popped element holds nothing once the caller has it.
-            element->~T();
+            taken->~T();
             // Release: the producer may reuse this slot as soon as it sees the
             // new index, and it must not do so before the move and this
             // destructor have finished.
@@ -197,9 +187,9 @@ class ring {
         std::size_t moved = 0;
         try {
             for (; moved < count; ++moved, ++out) {
-                T* const element = slot(read + moved);
-                *out = std::move(*element);
-                element->~T();
+                T* const taken = element(read + moved);
+                *out = std::move(*taken);
+                taken->~T();
             }
         } catch (...) {
             read_.store(read + moved, std::memory_order_release);
@@ -213,42 +203,143 @@ class ring {
     /// it is already history, so it is for metrics and never for control flow.
     ///
     /// A third thread may call it as well, and always gets a value in
-    /// [0, Capacity]. read_ only grows and never passes write_, so loading it
+    /// [0, capacity()]. read_ only grows and never passes write_, so loading it
     /// before write_ keeps the difference non-negative for any observer, and the
     /// clamp covers an observer whose two loads straddle a pop followed by a
     /// push. For the producer and the consumer the result is exact.
     [[nodiscard]] std::size_t size() const noexcept {
         const std::size_t read = read_.load(std::memory_order_acquire);
         const std::size_t write = write_.load(std::memory_order_acquire);
-        return std::min(write - read, Capacity);
+        return std::min(write - read, ring_capacity());
     }
 
     [[nodiscard]] bool empty() const noexcept { return size() == 0; }
-    [[nodiscard]] bool full() const noexcept { return size() == Capacity; }
+    [[nodiscard]] bool full() const noexcept { return size() == ring_capacity(); }
 
-  private:
-    friend struct detail::test_access<ring>;
+  protected:
+    ring_core() = default;
+    ~ring_core() = default;
 
-    static constexpr std::size_t slot_alignment = std::max(detail::cache_line, alignof(T));
-
-    [[nodiscard]] void* raw_slot(std::size_t index) noexcept {
-        return slots_ + (index & (Capacity - 1)) * sizeof(T);
+    /// Destroys whatever is still queued. There is no synchronisation here and
+    /// none is possible, so this may run only once both threads have been
+    /// joined and nobody is pushing or popping any more. The derived destructor
+    /// calls it, where the derived object and so its storage is still whole.
+    void destroy_queued() noexcept {
+        const std::size_t read = read_.load(std::memory_order_relaxed);
+        const std::size_t write = write_.load(std::memory_order_relaxed);
+        for (std::size_t index = read; index != write; ++index) element(index)->~T();
     }
 
-    [[nodiscard]] T* slot(std::size_t index) noexcept {
+  private:
+    friend struct test_access<Derived>;
+
+    [[nodiscard]] Derived& self() noexcept { return *static_cast<Derived*>(this); }
+    [[nodiscard]] const Derived& self() const noexcept {
+        return *static_cast<const Derived*>(this);
+    }
+
+    [[nodiscard]] std::size_t ring_capacity() const noexcept { return self().capacity(); }
+    [[nodiscard]] void* raw_slot(std::size_t index) noexcept { return self().slot(index); }
+    [[nodiscard]] T* element(std::size_t index) noexcept {
         return std::launder(reinterpret_cast<T*>(raw_slot(index)));
     }
 
     // Indices count forever and are masked at use. Subtraction is correct
     // across the unsigned wrap, and because the capacity is a power of two the
     // wrap does not shift the alignment.
-    alignas(detail::cache_line) std::atomic<std::size_t> write_{0};
-    alignas(detail::cache_line) std::atomic<std::size_t> read_{0};
+    alignas(cache_line) std::atomic<std::size_t> write_{0};
+    alignas(cache_line) std::atomic<std::size_t> read_{0};
+};
+
+}  // namespace detail
+
+/// A bounded queue for exactly one producing thread and one consuming thread.
+///
+/// Capacity must be a power of two: the indices then wrap by masking, and a
+/// wrap of the counter itself stays aligned to the capacity, which is what
+/// keeps the queue correct after 2^64 operations instead of subtly wrong.
+///
+/// An element lives from its push to its pop: constructed in place in a slot,
+/// destroyed as it leaves. T therefore needs no default constructor, and a
+/// ring holds no T until something is pushed into it.
+template <typename T, std::size_t Capacity>
+class ring : public detail::ring_core<ring<T, Capacity>, T> {
+    static_assert(detail::is_power_of_two(Capacity), "capacity must be a power of two");
+
+  public:
+    ring() = default;
+
+    ~ring() { this->destroy_queued(); }
+
+    [[nodiscard]] static constexpr std::size_t capacity() noexcept { return Capacity; }
+
+  private:
+    friend class detail::ring_core<ring, T>;
+
+    [[nodiscard]] void* slot(std::size_t index) noexcept {
+        return slots_ + (index & (Capacity - 1)) * sizeof(T);
+    }
+
     // Raw storage rather than an array of T: the queue owns a slot's bytes for
-    // its whole life and the element in them only from a push to a pop. The
-    // alignment keeps the slots off the indices' lines and every slot aligned
-    // for T.
-    alignas(slot_alignment) unsigned char slots_[Capacity * sizeof(T)];
+    // its whole life and the element in them only from a push to a pop.
+    alignas(detail::slot_alignment<T>) unsigned char slots_[Capacity * sizeof(T)];
+};
+
+/// The same queue with its capacity taken at run time and its slots on the
+/// heap, for a capacity that is a configuration value rather than a constant.
+///
+/// create is the only way in, because a capacity that arrives at run time can
+/// be one the queue cannot honour and a constructor would have to throw to say
+/// so. It never rounds up: a request for 1000 is refused rather than quietly
+/// becoming 1024.
+template <typename T>
+class heap_ring : public detail::ring_core<heap_ring<T>, T> {
+  public:
+    /// Returns null for a capacity of 0, for one that is not a power of two,
+    /// for one whose byte size does not fit in a size_t, and for a failed
+    /// allocation. Nothing on this path throws.
+    [[nodiscard]] static std::unique_ptr<heap_ring> create(std::size_t capacity) noexcept {
+        if (!detail::is_power_of_two(capacity)) return nullptr;  // 0 included
+        if (capacity > std::numeric_limits<std::size_t>::max() / sizeof(T)) return nullptr;
+
+        void* const slots =
+            ::operator new(capacity * sizeof(T), std::align_val_t{detail::slot_alignment<T>},
+                           std::nothrow);
+        if (slots == nullptr) return nullptr;
+
+        auto* const queue =
+            new (std::nothrow) heap_ring(capacity, static_cast<unsigned char*>(slots));
+        if (queue == nullptr) {
+            ::operator delete(slots, std::align_val_t{detail::slot_alignment<T>});
+            return nullptr;
+        }
+        return std::unique_ptr<heap_ring>(queue);
+    }
+
+    /// Destroys whatever is still queued and then frees the slots, which were
+    /// allocated once in create. As for the fixed-capacity ring, this may run
+    /// only once both threads are done with the queue.
+    ~heap_ring() {
+        this->destroy_queued();
+        ::operator delete(slots_, std::align_val_t{detail::slot_alignment<T>});
+    }
+
+    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+
+  private:
+    friend class detail::ring_core<heap_ring, T>;
+
+    heap_ring(std::size_t capacity, unsigned char* slots) noexcept
+        : capacity_(capacity), slots_(slots) {}
+
+    [[nodiscard]] void* slot(std::size_t index) noexcept {
+        return slots_ + (index & (capacity_ - 1)) * sizeof(T);
+    }
+
+    // Written once in create and read-only afterwards, so they cost nothing
+    // where they land: beside read_, the line a push has to fetch anyway.
+    std::size_t capacity_;
+    unsigned char* slots_;
 };
 
 }  // namespace spscring
