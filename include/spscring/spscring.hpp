@@ -216,6 +216,97 @@ class ring_core {
     [[nodiscard]] bool empty() const noexcept { return size() == 0; }
     [[nodiscard]] bool full() const noexcept { return size() == ring_capacity(); }
 
+    /// The pushing end: try_push, try_push_n and capacity(), and nothing that
+    /// belongs to the other side.
+    ///
+    /// It holds a pointer, so the ring has to outlive it; that is a claim the
+    /// caller makes and nothing here checks. Move-only, because a handle that
+    /// could be copied would be a second producer, and a moved-from one refuses
+    /// rather than following the pointer it gave away.
+    class producer {
+      public:
+        producer(producer&& other) noexcept : ring_(std::exchange(other.ring_, nullptr)) {}
+        producer& operator=(producer&& other) noexcept {
+            ring_ = std::exchange(other.ring_, nullptr);
+            return *this;
+        }
+        producer(const producer&) = delete;
+        producer& operator=(const producer&) = delete;
+        ~producer() = default;
+
+        template <typename U, typename = std::enable_if_t<std::is_constructible_v<T, U&&>>>
+        [[nodiscard]] bool try_push(U&& value) {
+            return ring_ != nullptr && ring_->try_push(std::forward<U>(value));
+        }
+
+        template <typename ForwardIt>
+        [[nodiscard]] std::size_t try_push_n(ForwardIt first, std::size_t n) {
+            return ring_ == nullptr ? 0 : ring_->try_push_n(first, n);
+        }
+
+        [[nodiscard]] std::size_t capacity() const noexcept {
+            return ring_ == nullptr ? 0 : ring_->capacity();
+        }
+
+      private:
+        friend ring_core<Derived, T>;
+
+        explicit producer(Derived* ring) noexcept : ring_(ring) {}
+
+        Derived* ring_ = nullptr;
+    };
+
+    /// The popping end: try_pop, try_pop_n and size(). The same ownership and
+    /// the same refusal as producer.
+    class consumer {
+      public:
+        consumer(consumer&& other) noexcept : ring_(std::exchange(other.ring_, nullptr)) {}
+        consumer& operator=(consumer&& other) noexcept {
+            ring_ = std::exchange(other.ring_, nullptr);
+            return *this;
+        }
+        consumer(const consumer&) = delete;
+        consumer& operator=(const consumer&) = delete;
+        ~consumer() = default;
+
+        [[nodiscard]] std::optional<T> try_pop() {
+            if (ring_ == nullptr) return std::nullopt;
+            return ring_->try_pop();
+        }
+
+        template <typename OutputIt>
+        [[nodiscard]] std::size_t try_pop_n(OutputIt out, std::size_t max) {
+            return ring_ == nullptr ? 0 : ring_->try_pop_n(out, max);
+        }
+
+        [[nodiscard]] std::size_t size() const noexcept {
+            return ring_ == nullptr ? 0 : ring_->size();
+        }
+
+      private:
+        friend ring_core<Derived, T>;
+
+        explicit consumer(Derived* ring) noexcept : ring_(ring) {}
+
+        Derived* ring_ = nullptr;
+    };
+
+    /// Hands out one producer and one consumer the first time it is called and
+    /// std::nullopt every time after. Called by whoever owns the ring, before
+    /// the two threads exist.
+    ///
+    /// The ring's own try_push and try_pop stay public, so this does not make
+    /// the single-producer rule unbreakable - it keeps it for the code that goes
+    /// through the handles.
+    [[nodiscard]] std::optional<std::pair<producer, consumer>> split() noexcept {
+        // Relaxed: the exchange itself is the whole decision, and the ring was
+        // constructed before any caller could reach this. A handle gets to the
+        // thread that uses it by being moved into it, which synchronises on its
+        // own.
+        if (split_.exchange(true, std::memory_order_relaxed)) return std::nullopt;
+        return std::pair<producer, consumer>(producer(&self()), consumer(&self()));
+    }
+
   protected:
     ring_core() = default;
     ~ring_core() = default;
@@ -248,6 +339,10 @@ class ring_core {
     // across the unsigned wrap, and because the capacity is a power of two the
     // wrap does not shift the alignment.
     alignas(cache_line) std::atomic<std::size_t> write_{0};
+    // Touched only by split(), which runs before the queue carries anything, so
+    // it rides in the padding after write_ instead of widening the object by a
+    // line of its own.
+    std::atomic<bool> split_{false};
     alignas(cache_line) std::atomic<std::size_t> read_{0};
 };
 

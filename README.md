@@ -156,11 +156,38 @@ of two, or smaller than `alignof(std::atomic<std::size_t>)`, is a compile error
 rather than a silently worse layout. The slots take the larger of that number
 and `alignof(T)`.
 
+## Handing out the two ends
+
+`split()` returns one `producer` and one `consumer` the first time it is called
+and `std::nullopt` every time after, decided by a single atomic exchange:
+
+```cpp
+spscring::ring<message, 4096> queue;
+auto ends = queue.split();              // std::nullopt on a second call
+auto [tx, rx] = std::move(*ends);
+
+std::thread sender([tx = std::move(tx)]() mutable { tx.try_push(m); });
+if (const auto m = rx.try_pop()) { handle(*m); }
+```
+
+`producer` has `try_push`, `try_push_n` and `capacity()`; `consumer` has
+`try_pop`, `try_pop_n` and `size()`. Both are move-only, so one handle cannot
+become two, and a moved-from handle refuses: `try_push` returns `false` and
+`try_pop` returns `std::nullopt` rather than touching a ring it no longer points
+at.
+
+The handles hold a pointer. The ring has to outlive them, which the header says
+and nothing checks. The flag that remembers the split lives in the padding of
+`write_`'s cache line, so the object is the same three lines wide as before, and
+`split()` is on the shared core, so `heap_ring` has it too.
+
 ## What it is not
 
-**Not multi-producer or multi-consumer.** Two producers will corrupt it. The
-name says so, and the type cannot enforce it, so this is the one thing a caller
-has to get right.
+**Not multi-producer or multi-consumer.** Two producers will corrupt it.
+`split()` keeps the rule for code that goes through the handles, since it hands
+them out once and neither can be copied. The ring's own `try_push` and
+`try_pop` stay public, though, so a caller that reaches past the handles is
+still the one who has to get this right.
 
 **Not lock-free in the sense of wait-free.** `try_push` and `try_pop` never
 block, but a full queue means the producer has to decide what to do, and this
@@ -173,13 +200,13 @@ correct baseline you can read in one sitting.
 
 | | |
 |---|---|
-| Implemented | bounded ring for one producer and one consumer, elements constructed on push and destroyed on pop, a single move out per element, no default constructor required of `T`, power-of-two capacity, a heap-allocated variant whose run-time capacity is checked and never rounded, batch push and pop that each publish with one store and wrap past the end of the array, indices on cache lines of their own (128 bytes on aarch64 and x86-64, overridable), instantaneous `size` for metrics, safe to sample from a third thread, order kept across the 2^64 index wrap |
+| Implemented | bounded ring for one producer and one consumer, elements constructed on push and destroyed on pop, a single move out per element, no default constructor required of `T`, power-of-two capacity, a heap-allocated variant whose run-time capacity is checked and never rounded, batch push and pop that each publish with one store and wrap past the end of the array, one producer and one consumer handle handed out once by `split()`, indices on cache lines of their own (128 bytes on aarch64 and x86-64, overridable), instantaneous `size` for metrics, safe to sample from a third thread, order kept across the 2^64 index wrap |
 | Not yet | a blocking wrapper with futex-style waiting |
 
 ## Development
 
 ```bash
-make test   # 2235 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make test   # 2257 checks under AddressSanitizer and UndefinedBehaviorSanitizer
 make race   # the same suites under ThreadSanitizer
 make demo   # one million messages through a 4096-slot queue
 ```
