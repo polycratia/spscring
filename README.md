@@ -206,14 +206,34 @@ correct baseline you can read in one sitting.
 ## Development
 
 ```bash
-make test   # 2257 checks under AddressSanitizer and UndefinedBehaviorSanitizer
-make race   # the same suites under ThreadSanitizer
-make demo   # one million messages through a 4096-slot queue
+make test          # 2257 checks under AddressSanitizer and UndefinedBehaviorSanitizer
+make race          # the same suites under ThreadSanitizer
+make race-control  # shows that make race can fail
+make demo          # one million messages through a 4096-slot queue
 ```
 
 `make race` is not optional in spirit: ThreadSanitizer is the only one of the
 three that can see a missing acquire or release, and a lock-free queue that has
 not been through it has not been checked.
+
+A clean ThreadSanitizer run is worth only as much as the tool's teeth, so
+`make race-control` measures them. `tests/race_control.cpp` is a minimal copy of
+the push/pop index protocol rather than a use of the header — the header offers
+no way to ask for the wrong ordering, which is the point of it — and the target
+builds that copy three times, transferring 200,000 ints through 64 slots between
+two threads each time: once correct, once with the consumer's acquire load of
+the write index relaxed, and once with the producer's release store relaxed.
+Those last two are bug 1 above, from each side. The target passes only when the
+correct build exits 0 and both weakened builds exit 66, the exit code the runs
+ask ThreadSanitizer for; otherwise it prints
+`make race has no teeth: <variant> exited <code>` and fails. The runs also set
+`abort_on_error=0`, because ThreadSanitizer aborts by default on macOS and a
+reported run then dies with SIGABRT and exit 134 instead. On Apple clang 21 the
+three exit 0, 66 and 66.
+
+It is not part of `make test`, and what it proves is bounded: that
+ThreadSanitizer in this toolchain catches this shape of weakened ordering, not
+that the header is correct.
 
 ## License
 
