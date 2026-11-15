@@ -40,33 +40,52 @@ auto configured = spscring::heap_ring<message>::create(n);   // null unless n is
 Header-only, C++17, no exceptions, and no allocation after construction:
 `heap_ring` does its one allocation in `create` and none afterwards.
 
-## The ordering, in four lines
+## The ordering, access by access
 
-```cpp
-// push
-const auto write = write_.load(std::memory_order_relaxed);  // ours; nobody else writes it
-const auto read  = read_.load(std::memory_order_acquire);   // theirs; must see their progress
-::new (raw_slot(write)) T(std::forward<U>(value));          // built in the slot
-write_.store(write + 1, std::memory_order_release);         // element visible before the index
-```
+One row per atomic access: the order it asks for, the access on the other
+thread it pairs with, what breaks if it is weakened, and the test that fails
+when it is. The copy of this table in `include/spscring/spscring.hpp`, above
+`detail::ring_core`, is the authoritative one — it sits beside the accesses it
+describes, and this is a copy of it.
 
-The release on the store is what makes the element visible before the index that
-advertises it. Swapping those two lines is the classic bug, and it is invisible
-on x86.
+| Access | Order | Pairs with | What weakening breaks | Test that fails |
+|---|---|---|---|---|
+| `try_push`: `write_.load` | relaxed | nothing — nobody else writes `write_` | nothing weaker to ask for | already relaxed |
+| `try_push`: `read_.load` | acquire | `read_.store` in `try_pop` and `try_pop_n` | a slot reused before the consumer's move out of it and its `~T()` have finished | reasoning only |
+| `try_push`: `write_.store` | release | `write_.load` in `try_pop` and `try_pop_n` | an element read before its contents on ARM | `make race-control`, store variant |
+| `try_push_n`: `write_.load` | relaxed | nothing — nobody else writes `write_` | nothing weaker to ask for | already relaxed |
+| `try_push_n`: `read_.load` | acquire | `read_.store` in `try_pop` and `try_pop_n` | slots reused before the consumer's moves out of them have finished | reasoning only |
+| `try_push_n`: `write_.store`, one for the batch | release | `write_.load` in `try_pop` and `try_pop_n` | a half-built batch becomes visible, and its elements before their contents | reasoning only |
+| `try_pop`: `read_.load` | relaxed | nothing — nobody else writes `read_` | nothing weaker to ask for | already relaxed |
+| `try_pop`: `write_.load` | acquire | `write_.store` in `try_push` and `try_push_n` | an element read before its contents on ARM | `make race-control`, load variant |
+| `try_pop`: `read_.store` | release | `read_.load` in `try_push` and `try_push_n` | the producer reuses the slot before the move out of it and `~T()` have finished | reasoning only |
+| `try_pop_n`: `read_.load` | relaxed | nothing — nobody else writes `read_` | nothing weaker to ask for | already relaxed |
+| `try_pop_n`: `write_.load` | acquire | `write_.store` in `try_push` and `try_push_n` | a batch read before the contents of its elements | reasoning only |
+| `try_pop_n`: `read_.store`, one for the batch and one more on the throwing path | release | `read_.load` in `try_push` and `try_push_n` | slots reused while the moves out of them are still running | reasoning only |
+| `size`: `read_.load`, loaded first | acquire | `read_.store` in `try_pop` and `try_pop_n` | loading `write_` first lets an observer's two loads straddle a pop and a push, and the unsigned subtraction hands it a count near 2^64, with `empty()` and `full()` inheriting it | `a_watching_thread_never_sees_more_than_capacity` |
+| `size`: `write_.load`, loaded second | acquire | `write_.store` in `try_push` and `try_push_n` | nothing for the count itself; the acquire is for a caller that reads a slot on the strength of a count | reasoning only |
+| `split`: `split_.exchange` | relaxed | nothing — the exchange is the whole decision | nothing weaker to ask for; `split()` runs before either thread exists | already relaxed |
 
-The consumer is the mirror image: its release on `read_` is what stops the
-producer reusing a slot before the move out of it has finished. It moves the
-element exactly once, straight into the `std::optional` it returns, destroys
-what is left in the slot, and only then advances `read_` — so an element whose
-move throws is still queued, rather than destroyed by a queue that has already
-counted it as popped.
+Two rows name a test, and no more. The header offers no way to ask for the wrong
+ordering, which is the point of it, so `tests/race_control.cpp` is a copy of the
+index protocol built three times — correct, with the consumer's acquire load
+relaxed, and with the producer's release store relaxed — and those two
+weakenings are the two rows that name `make race-control`. Every other row says
+`reasoning only`, which is exactly what it is: a claim no test here can fail on,
+written down so it can be argued with. `already relaxed` means the access is to
+the thread's own index, which nobody else writes, so there is nothing weaker to
+ask for.
 
-`size()` loads `read_` first, `write_` second, and clamps the difference to the
-capacity. A monitoring thread's two loads can straddle a pop followed by a push;
-in the other order the unsigned subtraction hands it a number near 2^64, and
-`empty()` and `full()` inherit it. With the order and the clamp any third thread
-sees a value in `[0, capacity()]`, and the producer and the consumer still get an
-exact answer.
+`try_pop` moves the element exactly once, straight into the `std::optional` it
+returns, destroys what is left in the slot, and only then advances `read_` — so
+an element whose move throws is still queued, rather than destroyed by a queue
+that has already counted it as popped.
+
+`size()` clamps the difference to the capacity as well as loading the two
+indices in that order. The order keeps the subtraction non-negative for any
+observer; the clamp covers the observer whose loads straddle a pop followed by a
+push. With both, a third thread sees a value in `[0, capacity()]`, and the
+producer and the consumer still get an exact answer.
 
 Indices count forever and are masked at use. Because the capacity is a power of
 two, the eventual wrap of the counter itself stays aligned to the capacity —
@@ -138,9 +157,9 @@ slots are allocated once, in `create`, and freed in the destructor after the
 elements still queued are destroyed.
 
 Both types derive from `detail::ring_core`, which owns the two indices and every
-one of the atomic accesses above; the derived class only says how large it is
-and where a slot lives. There is one copy of the ordering, not two, and
-`detail::test_access` reaches the indices of either.
+one of the atomic accesses in the table above; the derived class only says how
+large it is and where a slot lives. There is one copy of the ordering, not two,
+and `detail::test_access` reaches the indices of either.
 
 ## The separation between the indices
 
@@ -206,11 +225,20 @@ correct baseline you can read in one sitting.
 ## Development
 
 ```bash
-make test          # 2257 checks under AddressSanitizer and UndefinedBehaviorSanitizer
-make race          # the same suites under ThreadSanitizer
+make test          # the three suites under AddressSanitizer and UndefinedBehaviorSanitizer
+make race          # the same three under ThreadSanitizer
 make race-control  # shows that make race can fail
 make demo          # one million messages through a 4096-slot queue
 ```
+
+The three suites are `tests/test_spscring.cpp` (ordering, element lifetimes, the
+counter wrap, the batch functions, the throwing paths, and the three-thread
+`size()` test), `tests/test_heap_ring.cpp` (what `create` refuses, and a
+run-time capacity carrying two threads' traffic) and `tests/test_split.cpp` (the
+handles, their move-only types, and the layout of the split flag). Each prints
+how many checks it ran; the number is not written down here, because every test
+added changes it and a count in a README that nobody updates is worse than no
+count at all.
 
 `make race` is not optional in spirit: ThreadSanitizer is the only one of the
 three that can see a missing acquire or release, and a lock-free queue that has
@@ -223,13 +251,13 @@ no way to ask for the wrong ordering, which is the point of it — and the targe
 builds that copy three times, transferring 200,000 ints through 64 slots between
 two threads each time: once correct, once with the consumer's acquire load of
 the write index relaxed, and once with the producer's release store relaxed.
-Those last two are bug 1 above, from each side. The target passes only when the
-correct build exits 0 and both weakened builds exit 66, the exit code the runs
-ask ThreadSanitizer for; otherwise it prints
-`make race has no teeth: <variant> exited <code>` and fails. The runs also set
-`abort_on_error=0`, because ThreadSanitizer aborts by default on macOS and a
-reported run then dies with SIGABRT and exit 134 instead. On Apple clang 21 the
-three exit 0, 66 and 66.
+Those last two are bug 1 above, from each side, and they are the two weakenings
+the table names. The target passes only when the correct build exits 0 and both
+weakened builds exit 66, the exit code the runs ask ThreadSanitizer for;
+otherwise it prints `make race has no teeth: <variant> exited <code>` and fails.
+The runs also set `abort_on_error=0`, because ThreadSanitizer aborts by default
+on macOS and a reported run then dies with SIGABRT and exit 134 instead. On
+Apple clang 21 the three exit 0, 66 and 66.
 
 It is not part of `make test`, and what it proves is bounded: that
 ThreadSanitizer in this toolchain catches this shape of weakened ordering, not

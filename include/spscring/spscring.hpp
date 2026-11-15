@@ -76,6 +76,71 @@ struct test_access;
 /// the batches, the count, and the order of each load and store - lives here,
 /// so a compile-time capacity and a run-time one share one copy of the
 /// reasoning rather than two that can drift apart.
+///
+/// Every one of those accesses, the access on the other thread it pairs with,
+/// what breaks when it is weakened, and the test that fails when it is. push
+/// stands for try_push and push_n for try_push_n; pop and pop_n likewise.
+///
+/// access                   order     pairs with           weakening breaks     test
+/// -----------------------  --------  -------------------  -------------------  ------------------
+/// push    write_.load      relaxed   ours alone           nothing weaker to    already relaxed
+///                                                         ask for
+/// push    read_.load       acquire   pop read_.store      a slot reused        reasoning only
+///                                                         before the move out
+///                                                         of it has finished
+/// push    write_.store     release   pop write_.load      an element read      make race-control,
+///                                                         before its contents  store variant
+///                                                         on ARM
+/// push_n  write_.load      relaxed   ours alone           nothing weaker to    already relaxed
+///                                                         ask for
+/// push_n  read_.load       acquire   pop read_.store      slots reused before  reasoning only
+///                                                         the moves out of
+///                                                         them have finished
+/// push_n  write_.store     release   pop write_.load      a half-built batch   reasoning only
+///                                                         visible, and its
+///                                                         elements before
+///                                                         their contents
+/// pop     read_.load       relaxed   ours alone           nothing weaker to    already relaxed
+///                                                         ask for
+/// pop     write_.load      acquire   push write_.store    an element read      make race-control,
+///                                                         before its contents  load variant
+///                                                         on ARM
+/// pop     read_.store      release   push read_.load      the producer reuses  reasoning only
+///                                                         the slot before the
+///                                                         move out of it and
+///                                                         ~T() have finished
+/// pop_n   read_.load       relaxed   ours alone           nothing weaker to    already relaxed
+///                                                         ask for
+/// pop_n   write_.load      acquire   push write_.store    a batch read before  reasoning only
+///                                                         the contents of its
+///                                                         elements
+/// pop_n   read_.store      release   push read_.load      slots reused while   reasoning only
+///                                                         the moves out of
+///                                                         them still run
+/// size    read_.load       acquire,  pop read_.store      loading write_       a_watching_thread_
+///                          first                          first hands any      never_sees_more_
+///                                                         observer a count     than_capacity
+///                                                         near 2^64, and
+///                                                         empty() and full()
+///                                                         with it
+/// size    write_.load      acquire,  push write_.store    nothing for the      reasoning only
+///                          second                         count itself; the
+///                                                         acquire is for a
+///                                                         caller that reads a
+///                                                         slot on its strength
+/// split   split_.exchange  relaxed   nothing: the         nothing weaker to    already relaxed
+///                                    exchange is the      ask for; split()
+///                                    whole decision       runs before either
+///                                                         thread exists
+///
+/// pop_n stores to read_ once more on its throwing path, with the same release
+/// and for the same reason: it hands back exactly the elements already moved
+/// out. The destructor's two loads are relaxed and are not in the table, since
+/// destroy_queued runs only once both threads are finished with the queue and
+/// there is nothing left to synchronise with.
+///
+/// README.md carries a copy of this table. This one is the authoritative copy:
+/// it is the one that sits beside the accesses it describes.
 template <typename Derived, typename T>
 class ring_core {
     static_assert(std::is_move_constructible_v<T>,
